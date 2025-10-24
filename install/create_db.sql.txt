@@ -1,0 +1,416 @@
+-- ============================================================================
+-- Billing CRM - Database Creation Script
+-- ============================================================================
+-- Проект: billing-crm
+-- Назначение: Учет токенов и платежей (без логики Gateway)
+-- Версия: 1.0
+-- Дата: 2024-01-20
+-- ============================================================================
+
+-- Удаление БД если существует (ОСТОРОЖНО!)
+-- DROP DATABASE IF EXISTS billing_crm;
+
+-- Создание базы данных
+CREATE DATABASE IF NOT EXISTS billing_crm 
+CHARACTER SET utf8mb4 
+COLLATE utf8mb4_unicode_ci;
+
+USE billing_crm;
+
+-- ============================================================================
+-- ТАБЛИЦЫ
+-- ============================================================================
+
+-- 1. Ожидающие подтверждения регистрации
+CREATE TABLE pending_registrations (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    email VARCHAR(255) NOT NULL,
+    email_hash VARCHAR(32) UNIQUE NOT NULL COMMENT 'MD5(email)',
+    password_hash VARCHAR(32) NOT NULL COMMENT 'MD5(password + salt)',
+    name VARCHAR(255) DEFAULT NULL,
+    confirmation_code VARCHAR(64) UNIQUE NOT NULL,
+    confirmed TINYINT(1) DEFAULT 0,
+    attempts INT DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    expires_at TIMESTAMP NOT NULL,
+    INDEX idx_email_hash (email_hash),
+    INDEX idx_confirmation_code (confirmation_code),
+    INDEX idx_expires (expires_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 2. Пользователи
+CREATE TABLE users (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    email_hash VARCHAR(32) UNIQUE NOT NULL COMMENT 'MD5(email)',
+    password_hash VARCHAR(32) NOT NULL COMMENT 'MD5(password + salt)',
+    name VARCHAR(255) DEFAULT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_login_at TIMESTAMP NULL,
+    status ENUM('active', 'suspended', 'deleted') DEFAULT 'active',
+    INDEX idx_email_hash (email_hash),
+    INDEX idx_status (status),
+    INDEX idx_created (created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 3. API ключи
+CREATE TABLE api_keys (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    user_id INT NOT NULL,
+    key_hash VARCHAR(32) UNIQUE NOT NULL COMMENT 'MD5(bcm_...)',
+    key_prefix VARCHAR(12) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_used_at TIMESTAMP NULL,
+    status ENUM('active', 'revoked') DEFAULT 'active',
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    INDEX idx_key_hash (key_hash),
+    INDEX idx_user_id (user_id),
+    INDEX idx_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 4. Балансы токенов
+CREATE TABLE user_balances (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    user_id INT NOT NULL UNIQUE,
+    tokens_purchased BIGINT DEFAULT 0,
+    tokens_used BIGINT DEFAULT 0,
+    tokens_available BIGINT GENERATED ALWAYS AS (tokens_purchased - tokens_used) STORED,
+    total_paid DECIMAL(10,2) DEFAULT 0.00,
+    last_payment_at TIMESTAMP NULL,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    INDEX idx_available (tokens_available),
+    INDEX idx_user_id (user_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 5. Платежи
+CREATE TABLE payments (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    user_id INT NOT NULL,
+    amount DECIMAL(10,2) NOT NULL,
+    tokens_added BIGINT NOT NULL,
+    payment_method VARCHAR(50) NOT NULL,
+    payment_id VARCHAR(255) DEFAULT NULL,
+    status ENUM('pending', 'completed', 'failed', 'refunded') DEFAULT 'pending',
+    metadata JSON DEFAULT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMP NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    INDEX idx_user_created (user_id, created_at),
+    INDEX idx_payment_id (payment_id),
+    INDEX idx_status (status),
+    INDEX idx_payment_method (payment_method)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 6. Подписки
+CREATE TABLE subscriptions (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    user_id INT NOT NULL,
+    plan_id INT NOT NULL,
+    payment_method VARCHAR(50) NOT NULL,
+    subscription_id VARCHAR(255) NOT NULL,
+    tokens_per_period BIGINT NOT NULL,
+    price_per_period DECIMAL(10,2) NOT NULL,
+    billing_period ENUM('monthly', 'yearly') DEFAULT 'monthly',
+    status ENUM('active', 'cancelled', 'expired') DEFAULT 'active',
+    next_billing_date DATE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    cancelled_at TIMESTAMP NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    INDEX idx_user_status (user_id, status),
+    INDEX idx_subscription_id (subscription_id),
+    INDEX idx_next_billing (next_billing_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 7. Тарифные планы
+CREATE TABLE pricing_plans (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    name VARCHAR(100) NOT NULL,
+    tokens_amount BIGINT NOT NULL,
+    price DECIMAL(10,2) NOT NULL,
+    discount_percent DECIMAL(5,2) DEFAULT 0,
+    is_active BOOLEAN DEFAULT TRUE,
+    description TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_active (is_active)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Связь подписок с планами (добавляем FK)
+ALTER TABLE subscriptions ADD FOREIGN KEY (plan_id) REFERENCES pricing_plans(id);
+
+-- Дефолтные тарифы
+INSERT INTO pricing_plans (name, tokens_amount, price, discount_percent, description) VALUES
+('Starter', 1000000, 1.00, 0, '1M tokens'),
+('Basic', 5000000, 4.50, 10, '5M tokens - 10% off'),
+('Pro', 10000000, 8.00, 20, '10M tokens - 20% off'),
+('Business', 50000000, 35.00, 30, '50M tokens - 30% off'),
+('Enterprise', 100000000, 60.00, 40, '100M tokens - 40% off');
+
+-- 8. Usage Log (от Gateway)
+CREATE TABLE usage_log (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    user_id INT NOT NULL,
+    api_key_id INT NOT NULL,
+    tokens_used INT NOT NULL,
+    source VARCHAR(50) DEFAULT 'gateway',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (api_key_id) REFERENCES api_keys(id) ON DELETE CASCADE,
+    INDEX idx_user_date (user_id, created_at),
+    INDEX idx_api_key (api_key_id),
+    INDEX idx_created (created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 9. Сессии
+CREATE TABLE sessions (
+    id VARCHAR(64) PRIMARY KEY,
+    user_id INT NOT NULL,
+    ip_address VARCHAR(45) DEFAULT NULL,
+    user_agent TEXT DEFAULT NULL,
+    last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    expires_at TIMESTAMP NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    INDEX idx_user_id (user_id),
+    INDEX idx_expires (expires_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 10. Аудит лог
+CREATE TABLE audit_log (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    user_id INT DEFAULT NULL,
+    action VARCHAR(100) NOT NULL,
+    entity_type VARCHAR(50) DEFAULT NULL,
+    entity_id INT DEFAULT NULL,
+    old_values JSON DEFAULT NULL,
+    new_values JSON DEFAULT NULL,
+    ip_address VARCHAR(45) DEFAULT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL,
+    INDEX idx_user_action (user_id, action),
+    INDEX idx_entity (entity_type, entity_id),
+    INDEX idx_created (created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ============================================================================
+-- ПРЕДСТАВЛЕНИЯ
+-- ============================================================================
+
+CREATE OR REPLACE VIEW user_statistics AS
+SELECT 
+    u.id,
+    u.email_hash,
+    u.name,
+    u.status,
+    u.created_at,
+    ub.tokens_purchased,
+    ub.tokens_used,
+    ub.tokens_available,
+    ub.total_paid,
+    COUNT(DISTINCT ak.id) as api_keys_count,
+    COUNT(DISTINCT ul.id) as total_requests
+FROM users u
+LEFT JOIN user_balances ub ON u.id = ub.user_id
+LEFT JOIN api_keys ak ON u.id = ak.user_id AND ak.status = 'active'
+LEFT JOIN usage_log ul ON u.id = ul.user_id
+GROUP BY u.id;
+
+CREATE OR REPLACE VIEW revenue_by_method AS
+SELECT 
+    payment_method,
+    COUNT(*) as transactions_count,
+    SUM(amount) as total_revenue,
+    AVG(amount) as avg_transaction
+FROM payments
+WHERE status = 'completed'
+GROUP BY payment_method;
+
+-- ============================================================================
+-- ХРАНИМЫЕ ПРОЦЕДУРЫ
+-- ============================================================================
+
+DELIMITER $$
+
+-- Добавление токенов
+DROP PROCEDURE IF EXISTS add_tokens_to_user$$
+CREATE PROCEDURE add_tokens_to_user(
+    IN p_user_id INT,
+    IN p_tokens BIGINT,
+    IN p_amount DECIMAL(10,2)
+)
+BEGIN
+    START TRANSACTION;
+    
+    UPDATE user_balances
+    SET tokens_purchased = tokens_purchased + p_tokens,
+        total_paid = total_paid + p_amount,
+        last_payment_at = NOW()
+    WHERE user_id = p_user_id;
+    
+    IF ROW_COUNT() = 0 THEN
+        INSERT INTO user_balances (user_id, tokens_purchased, total_paid, last_payment_at)
+        VALUES (p_user_id, p_tokens, p_amount, NOW());
+    END IF;
+    
+    COMMIT;
+END$$
+
+-- Списание токенов
+DROP PROCEDURE IF EXISTS deduct_tokens$$
+CREATE PROCEDURE deduct_tokens(
+    IN p_user_id INT,
+    IN p_api_key_id INT,
+    IN p_tokens INT
+)
+BEGIN
+    DECLARE available_tokens BIGINT;
+    
+    SELECT tokens_available INTO available_tokens
+    FROM user_balances
+    WHERE user_id = p_user_id;
+    
+    IF available_tokens < p_tokens THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Insufficient tokens';
+    END IF;
+    
+    START TRANSACTION;
+    
+    UPDATE user_balances
+    SET tokens_used = tokens_used + p_tokens
+    WHERE user_id = p_user_id;
+    
+    INSERT INTO usage_log (user_id, api_key_id, tokens_used)
+    VALUES (p_user_id, p_api_key_id, p_tokens);
+    
+    COMMIT;
+END$$
+
+-- Валидация ключа
+DROP PROCEDURE IF EXISTS validate_key$$
+CREATE PROCEDURE validate_key(
+    IN p_api_key VARCHAR(64),
+    IN p_tokens_required INT
+)
+BEGIN
+    DECLARE v_user_id INT;
+    DECLARE v_api_key_id INT;
+    DECLARE v_tokens_available BIGINT;
+    DECLARE v_key_hash VARCHAR(32);
+    
+    SET v_key_hash = MD5(p_api_key);
+    
+    SELECT ak.id, ak.user_id INTO v_api_key_id, v_user_id
+    FROM api_keys ak
+    JOIN users u ON ak.user_id = u.id
+    WHERE ak.key_hash = v_key_hash
+      AND ak.status = 'active'
+      AND u.status = 'active';
+    
+    IF v_user_id IS NULL THEN
+        SELECT FALSE as valid, 'Invalid API key' as error;
+    ELSE
+        SELECT tokens_available INTO v_tokens_available
+        FROM user_balances
+        WHERE user_id = v_user_id;
+        
+        IF v_tokens_available >= p_tokens_required THEN
+            SELECT 
+                TRUE as valid,
+                v_user_id as user_id,
+                v_api_key_id as api_key_id,
+                v_tokens_available as tokens_available;
+        ELSE
+            SELECT 
+                FALSE as valid,
+                'Insufficient tokens' as error,
+                v_tokens_available as tokens_available;
+        END IF;
+    END IF;
+END$$
+
+-- Получение баланса
+DROP PROCEDURE IF EXISTS get_user_balance$$
+CREATE PROCEDURE get_user_balance(
+    IN p_api_key VARCHAR(64)
+)
+BEGIN
+    DECLARE v_user_id INT;
+    DECLARE v_key_hash VARCHAR(32);
+    
+    SET v_key_hash = MD5(p_api_key);
+    
+    SELECT user_id INTO v_user_id
+    FROM api_keys
+    WHERE key_hash = v_key_hash AND status = 'active';
+    
+    IF v_user_id IS NOT NULL THEN
+        SELECT 
+            v_user_id as user_id,
+            tokens_purchased,
+            tokens_used,
+            tokens_available,
+            total_paid
+        FROM user_balances
+        WHERE user_id = v_user_id;
+    ELSE
+        SELECT NULL as user_id, 'Invalid API key' as error;
+    END IF;
+END$$
+
+DELIMITER ;
+
+-- ============================================================================
+-- СОБЫТИЯ
+-- ============================================================================
+
+SET GLOBAL event_scheduler = ON;
+
+DELIMITER $$
+
+DROP EVENT IF EXISTS cleanup_expired_registrations$$
+CREATE EVENT cleanup_expired_registrations
+ON SCHEDULE EVERY 1 HOUR
+DO
+BEGIN
+    DELETE FROM pending_registrations 
+    WHERE expires_at < NOW() AND confirmed = 0;
+END$$
+
+DROP EVENT IF EXISTS cleanup_expired_sessions$$
+CREATE EVENT cleanup_expired_sessions
+ON SCHEDULE EVERY 1 HOUR
+DO
+BEGIN
+    DELETE FROM sessions WHERE expires_at < NOW();
+END$$
+
+DELIMITER ;
+
+-- ============================================================================
+-- ПОЛЬЗОВАТЕЛЬ БД
+-- ============================================================================
+
+DROP USER IF EXISTS 'billing_app'@'localhost';
+CREATE USER 'billing_app'@'localhost' IDENTIFIED BY 'CHANGE_THIS_PASSWORD!';
+
+GRANT SELECT, INSERT, UPDATE ON billing_crm.users TO 'billing_app'@'localhost';
+GRANT SELECT, INSERT, UPDATE ON billing_crm.api_keys TO 'billing_app'@'localhost';
+GRANT SELECT, INSERT, UPDATE ON billing_crm.user_balances TO 'billing_app'@'localhost';
+GRANT SELECT, INSERT, UPDATE ON billing_crm.payments TO 'billing_app'@'localhost';
+GRANT SELECT, INSERT ON billing_crm.usage_log TO 'billing_app'@'localhost';
+GRANT SELECT, INSERT, UPDATE, DELETE ON billing_crm.pending_registrations TO 'billing_app'@'localhost';
+GRANT SELECT, INSERT, UPDATE, DELETE ON billing_crm.sessions TO 'billing_app'@'localhost';
+GRANT SELECT ON billing_crm.pricing_plans TO 'billing_app'@'localhost';
+GRANT SELECT, INSERT ON billing_crm.audit_log TO 'billing_app'@'localhost';
+GRANT EXECUTE ON PROCEDURE billing_crm.add_tokens_to_user TO 'billing_app'@'localhost';
+GRANT EXECUTE ON PROCEDURE billing_crm.deduct_tokens TO 'billing_app'@'localhost';
+GRANT EXECUTE ON PROCEDURE billing_crm.validate_key TO 'billing_app'@'localhost';
+GRANT EXECUTE ON PROCEDURE billing_crm.get_user_balance TO 'billing_app'@'localhost';
+
+FLUSH PRIVILEGES;
+
+-- ============================================================================
+-- ГОТОВО
+-- ============================================================================
+
+SELECT 'Billing CRM Database created successfully!' AS Status;
+SELECT COUNT(*) AS tables_created FROM information_schema.TABLES WHERE TABLE_SCHEMA = 'billing_crm';
